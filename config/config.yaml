@@ -1,0 +1,56 @@
+project:
+  name: MagiMatch
+  version: "4.0"
+
+paths:
+  raw_data: data/raw
+  processed: data/processed
+  embeddings: data/embeddings
+  checkpoints: data/checkpoints
+  db: data/processed/magimatch.db
+
+scraper:
+  base_url: "https://www.conjuringarchive.com"
+  book_url_template: "https://www.conjuringarchive.com/list/book/{id}"
+  id_range_start: 1
+  id_range_end: 5000
+  batch_size: 50
+  request_delay: 1.0
+  timeout: 30
+
+processor:
+  front_matter_titles:
+    - "Foreword"
+    - "Preface"
+    - "Introduction"
+    - "Acknowledgements"
+    - "Acknowledgments"
+    - "Table of Contents"
+    - "Bibliography"
+    - "Dedication"
+    - "Appendix"
+    - "Glossary"
+    - "Index"
+    - "About the Author"
+    - "Copyright"
+    - "Colophon"
+  junk_categories:
+    - "Intros & Epilogues"
+    - "Articles"
+    - "General"
+    - "Miscellaneous"
+
+embeddings:
+  model: "text-embedding-3-small"
+  dimensions: 1536
+  batch_size: 512
+
+llm:
+  model: "gpt-4o-mini"
+  max_tokens: 1000
+  temperature: 0.3
+
+ui:
+  title: "MagiMatch"
+  share: true
+  server_port: 7860
