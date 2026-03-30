@@ -499,8 +499,8 @@ class QueryEngine:
         emb_path = self.embeddings_dir / "tricks.npy"
         ids_path = self.embeddings_dir / "trick_ids.npy"
         if emb_path.exists() and ids_path.exists():
-            self.embeddings = np.load(str(emb_path))
-            self.trick_ids = np.load(str(ids_path))
+            self.embeddings = np.load(str(emb_path), allow_pickle=True)
+            self.trick_ids = np.load(str(ids_path), allow_pickle=True)
             print(f"✅ Loaded {len(self.trick_ids):,} embeddings ({self.embeddings.shape[1]}d)")
         else:
             self.embeddings = None
