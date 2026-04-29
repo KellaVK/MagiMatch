@@ -1,18 +1,27 @@
 """
-query_engine.py — MagiMatch v5 Query Engine.
+query_engine.py — MagiMatch v5 Query Engine (patched).
 
-Adapted from v4. Pipeline:
+Pipeline:
   1. Intent parsing (gpt-4o-mini)
-  2. Person style expansion (profiles dict → Serper → DB fallback)
-  3. Title pre-pass (SQL exact + fuzzy)
-  4. Semantic search (cosine similarity over tricks.npy)
-  5. Merge + deduplicate
-  6. AI descriptions (batched gpt-4o-mini)
-  7. Commentary (gpt-4o-mini)
+  2. Plot-alias expansion
+  3. Person style expansion (profiles dict → Serper → DB fallback)
+  4. Title pre-pass (SQL exact + fuzzy on book AND trick titles)
+  5. Semantic search (cosine similarity over tricks.npy)
+  6. Merge + deduplicate (with required_keywords + propless hard-filter)
+  7. AI descriptions (batched gpt-4o-mini)
+  8. Commentary (gpt-4o-mini)
 
-Exposes:
-  - QueryEngine class  (used by the Colab notebook)
-  - build_result_card() (used by the Gradio UI)
+Fixes vs v5 original:
+  - require_no_props: props column doesn't exist → now expands query +
+    injects prop terms into excluded_keywords
+  - Title query early return now applies full merge_results filtering
+  - required_keywords: new intent field; hard-filters results missing the prop
+  - MAGIC_PLOT_ALIASES: expands plot-description queries (e.g. "trick that
+    cannot be explained") into technique keywords
+  - title_search: now also searches trick titles, not just book titles
+  - get_style_description: fixed DB column names (canonical_name, no style_summary)
+  - Regex safety net for "similar to X" / "like X" patterns in parse_intent
+  - generate_descriptions: more robust JSON parsing
 """
 
 import json
@@ -31,8 +40,6 @@ logger = get_logger("query_engine")
 
 
 # ── Magician profiles ──────────────────────────────────────────────────────────
-# Focus on what makes each person DISTINCTIVE, not their genre.
-# These drive semantic query expansion.
 MAGICIAN_PROFILES = {
     # Mentalists
     "matt mello": "propless mentalism entirely without props no cards no objects pure psychological effects direct mind reading no setup invisible technique",
@@ -76,6 +83,75 @@ MAGICIAN_PROFILES = {
 
 # Runtime style cache
 _style_cache: dict = {}
+
+
+# ── Magic plot aliases ─────────────────────────────────────────────────────────
+# Maps descriptive phrases / informal plot names → rich search terms.
+# Matched case-insensitively against the raw query.
+MAGIC_PLOT_ALIASES: dict[str, str] = {
+    # Classic "impossible" plots
+    "trick that cannot be explained": (
+        "out of this world paul curry spectator sorts cards red black "
+        "inexplicable self-working hands-off impossible classic plot"
+    ),
+    "the trick that cannot be explained": (
+        "out of this world paul curry spectator sorts cards red black "
+        "inexplicable self-working hands-off impossible classic"
+    ),
+    "out of this world": (
+        "out of this world paul curry spectator sorts red black cards "
+        "impossible hands-off self-working classic plot"
+    ),
+    # Classic plots by description
+    "ambitious card": (
+        "ambitious card rising to top classic repeat vanish appear card control"
+    ),
+    "four aces": (
+        "four ace assembly trick production gathering revelation ace location aces"
+    ),
+    "coins across": (
+        "coins across travel han ping chien multiple coins transposition "
+        "coin vanish appear migration"
+    ),
+    "card in wallet": "card to wallet transposition transportation surprise revelation",
+    "bill in lemon": "signed bill in lemon fruit transposition signed currency penetration",
+    "color change": "visual color change transformation top change packet color",
+    "anniversary waltz": "anniversary waltz cards matching mates romantic pairs revelation",
+    "slow motion four aces": "slow motion four aces rene lavand one hand assembly patience",
+    "chicago opener": "red backed card Chicago opener revelation surprise ending red card",
+    "two card monte": "two card monte three card transposition deceptive visual",
+    "living dead": "living dead test mentalism billet work telepathy",
+    "pick a card": "card selection force peek glimpse classic card trick any card",
+    "rising card": "card rises from deck mechanical elevator card magic",
+    "card to impossible location": "card to impossible location transportation penetration surprise",
+    "collectors": "collectors four cards sandwich collectors plot",
+    "triumph": "triumph face up face down shuffle restoration spectator chaos",
+    "twisting the aces": "twisting aces Ed Ullis packet face up face down flip rotation",
+    "oil and water": "oil and water red black cards separate interlace mix",
+    "reset": "reset Paul Harris aces four card transposition instant reset",
+    "slow motion aces": "slow motion aces Vernon classic assembly deceptive natural",
+    "the matrix": "matrix Al Schneider coins under cards travel vanish appear",
+    "coins through table": "coins through table penetration solid through solid coin magic",
+    "sponge balls": "sponge ball vanish appear multiply comedy classic children",
+    "linking rings": "linking rings chinese rings link unlink solid metal penetration",
+    "cups and balls": "cups and balls classic three shells penetration vanish appear final load",
+}
+
+# ── Propless / no-props support ────────────────────────────────────────────────
+# Appended to the semantic query when require_no_props=True.
+PROPLESS_EXPANSION = (
+    "propless no props empty hands pure psychological mental "
+    "no cards no coins no objects no deck thought impression "
+    "verbal force suggestion bare hands invisible nothing"
+)
+
+# These prop terms are added to excluded_keywords when require_no_props=True,
+# hard-filtering tricks whose descriptions mention physical objects.
+PROPLESS_EXCLUDED_PROPS = [
+    "card", "deck", "coin", "rope", "wand", "ball", "silk",
+    "sponge", "envelope", "wallet", "billet", "pen",
+    "phone", "watch", "ring", "handkerchief", "paper", "cup",
+]
 
 
 # ── Serper web lookup ──────────────────────────────────────────────────────────
@@ -149,19 +225,8 @@ def get_style_description(name: str, conn, web_enriched: list) -> str:
         except Exception as e:
             logger.warning(f"GPT style summary failed for {name}: {e}")
 
-    # 3. DB style_summary column (v5 feature — skip gracefully on v4 DB)
-    try:
-        row = conn.execute(
-            "SELECT style_summary FROM persons WHERE LOWER(name) LIKE ? AND style_summary IS NOT NULL",
-            (f"%{key}%",),
-        ).fetchone()
-        if row and row["style_summary"]:
-            _style_cache[key] = row["style_summary"]
-            return row["style_summary"]
-    except Exception:
-        pass
-
-    # 4. DB fallback: infer from credited tricks
+    # 3. DB fallback: infer from credited tricks
+    # NOTE: persons table has canonical_name (not name) and no style_summary column.
     db_text = _db_style_lookup(name, conn)
     if db_text:
         prompt = (
@@ -175,17 +240,57 @@ def get_style_description(name: str, conn, web_enriched: list) -> str:
         except Exception:
             pass
 
-    # 5. Just use the name
+    # 4. Just use the name
     return name
 
 
 # ── Intent parsing ─────────────────────────────────────────────────────────────
 
+# Regex safety net for "similar to X" / "like X" patterns.
+# Used AFTER GPT parsing to ensure referenced_persons is always populated.
+_SIMILAR_PATTERNS = [
+    re.compile(r"\bsimilar\s+to\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+    re.compile(r"\blike\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+    re.compile(r"\bin\s+the\s+style\s+of\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+]
+
+_EXCLUDED_PATTERNS = [
+    re.compile(r"\bnot\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+    re.compile(r"\bexclude\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+    re.compile(r"\bno\s+([A-Z][a-zA-Z .'-]+)", re.IGNORECASE),
+]
+
+
+def _regex_extract_persons(query: str):
+    """
+    Regex safety net: extract referenced and excluded persons from the raw query.
+    Returns (referenced: list[str], excluded: list[str]).
+    Only used to SUPPLEMENT (not override) GPT parsing.
+    """
+    referenced = []
+    for pat in _SIMILAR_PATTERNS:
+        for m in pat.finditer(query):
+            name = m.group(1).strip().rstrip(",.")
+            if len(name.split()) <= 4:  # guard against runaway captures
+                referenced.append(name)
+
+    excluded = []
+    for pat in _EXCLUDED_PATTERNS:
+        for m in pat.finditer(query):
+            name = m.group(1).strip().rstrip(",.")
+            if len(name.split()) <= 4:
+                excluded.append(name)
+
+    return referenced, excluded
+
+
 def parse_intent(query: str) -> dict:
     """
     Parse user query into structured intent using gpt-4o-mini.
-    Returns: {topic, keywords, excluded_persons, referenced_persons, is_title_query,
-              require_no_props, excluded_keywords}
+
+    Returns:
+        topic, keywords, excluded_persons, referenced_persons, is_title_query,
+        require_no_props, excluded_keywords, required_keywords, title
     """
     system = """You parse magic trick search queries into structured JSON.
 Return ONLY valid JSON with these fields:
@@ -194,83 +299,159 @@ Return ONLY valid JSON with these fields:
 - excluded_persons: list of strings, names the user wants EXPLICITLY EXCLUDED (e.g. "not Vernon", "not Asi Wind")
 - referenced_persons: list of strings, magicians whose STYLE is used as a model (e.g. "like Mello", "similar to Asi Wind") — do NOT add these to excluded_persons; they go here only
 - is_title_query: boolean, true if user is searching for a specific book or trick title
-- require_no_props: boolean, true if the user explicitly wants propless or impromptu effects (triggered by words like "propless", "no props", "no objects", "impromptu", "bare hands", "empty handed")
+- title: string or null, the specific book or trick title being searched — extract only the title text, omitting surrounding words like "tricks from" or "about" — only set when is_title_query is true
+- require_no_props: boolean, true ONLY when user explicitly wants effects with absolutely NO physical objects whatsoever — triggered ONLY by: "propless", "no props", "no objects", "empty handed", "bare hands" — do NOT set true for "impromptu", "no gimmicks", or other qualifiers
 - excluded_keywords: list of strings, concepts that must NOT appear in results — extract the root word (e.g. "no gimmicks" → ["gimmick"], "no cards" → ["card"], "no coins" → ["coin"], "no ropes" → ["rope"])
+- required_keywords: list of strings, specific prop types or concepts that MUST appear in results — extract root word when user is clearly specific about prop type (e.g. "coin tricks" → ["coin"], "rope magic" → ["rope"], "sponge ball" → ["sponge"]) — leave empty for general queries or when prop type is part of style not requirement
 """
     prompt = f'Parse this magic search query: "{query}"'
+    defaults = {
+        "topic": query,
+        "keywords": [],
+        "excluded_persons": [],
+        "referenced_persons": [],
+        "is_title_query": False,
+        "title": None,
+        "require_no_props": False,
+        "excluded_keywords": [],
+        "required_keywords": [],
+    }
     try:
-        raw = chat_completion(prompt, system=system, max_tokens=400, temperature=0.1, json_mode=True)
+        raw = chat_completion(prompt, system=system, max_tokens=500, temperature=0.1, json_mode=True)
         result = json.loads(raw)
-        return {
+        parsed = {
             "topic": result.get("topic", query),
             "keywords": result.get("keywords", []),
             "excluded_persons": [p.strip().lower() for p in result.get("excluded_persons", [])],
             "referenced_persons": [p.strip() for p in result.get("referenced_persons", [])],
             "is_title_query": bool(result.get("is_title_query", False)),
+            "title": result.get("title") or None,
             "require_no_props": bool(result.get("require_no_props", False)),
             "excluded_keywords": [k.strip().lower() for k in result.get("excluded_keywords", [])],
+            "required_keywords": [k.strip().lower() for k in result.get("required_keywords", [])],
         }
     except Exception as e:
         logger.warning(f"Intent parsing failed: {e}")
-        return {
-            "topic": query,
-            "keywords": [],
-            "excluded_persons": [],
-            "referenced_persons": [],
-            "is_title_query": False,
-            "require_no_props": False,
-            "excluded_keywords": [],
-        }
+        parsed = defaults.copy()
+
+    # Regex safety net: supplement GPT result with pattern-matched persons
+    regex_ref, regex_excl = _regex_extract_persons(query)
+    existing_ref_lower = {p.lower() for p in parsed["referenced_persons"]}
+    for name in regex_ref:
+        if name.lower() not in existing_ref_lower:
+            parsed["referenced_persons"].append(name)
+            existing_ref_lower.add(name.lower())
+
+    existing_excl = set(parsed["excluded_persons"])
+    for name in regex_excl:
+        nl = name.lower()
+        # Don't add to excluded if already in referenced
+        if nl not in existing_ref_lower and nl not in existing_excl:
+            parsed["excluded_persons"].append(nl)
+            existing_excl.add(nl)
+
+    return parsed
+
+
+# ── Plot alias expansion ───────────────────────────────────────────────────────
+
+def apply_plot_aliases(query: str) -> str:
+    """
+    If the query matches a known plot alias (case-insensitive substring),
+    append the alias's expansion to the query so semantic search finds the
+    right content even when descriptions don't use the user's exact phrasing.
+    """
+    q_lower = query.lower()
+    expansions = []
+    for phrase, expansion in MAGIC_PLOT_ALIASES.items():
+        if phrase in q_lower:
+            expansions.append(expansion)
+    if expansions:
+        return query + " " + " ".join(expansions)
+    return query
 
 
 # ── Title pre-pass ─────────────────────────────────────────────────────────────
 
-def title_search(query: str, conn) -> list:
-    """Exact then fuzzy SQL title match. Returns list of result dicts."""
-    results = []
+_TITLE_SELECT = """
+    SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
+           t.embed_text,
+           b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
+           GROUP_CONCAT(DISTINCT p.name) as authors
+    FROM tricks t
+    JOIN books b ON t.book_id = b.id
+    LEFT JOIN book_persons bp ON b.id = bp.book_id AND bp.role = 'author'
+    LEFT JOIN persons p ON bp.person_id = p.id
+"""
 
-    # Exact match on book title
+
+def title_search(query: str, conn, title_override: Optional[str] = None) -> list:
+    """
+    Search for tricks by book title or trick title.
+
+    Steps:
+      1. Exact match on book title
+      2. Fuzzy (word-by-word LIKE) on book title
+      3. Fuzzy on trick title (if no book title results)
+
+    Args:
+        query: raw user query (used if title_override is None)
+        title_override: extracted title string from intent parser (preferred)
+    """
+    search_text = (title_override or query).strip()
+    results: list = []
+    seen_ids: set = set()
+
+    # ── Pass 1: Exact book title match ────────────────────────────────────────
     rows = conn.execute(
-        """SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
-                  t.embed_text, t.props,
-                  b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
-                  GROUP_CONCAT(DISTINCT p.name) as authors
-           FROM tricks t
-           JOIN books b ON t.book_id = b.id
-           LEFT JOIN book_persons bp ON b.id = bp.book_id AND bp.role = 'author'
-           LEFT JOIN persons p ON bp.person_id = p.id
-           WHERE LOWER(b.title) = LOWER(?)
-           GROUP BY t.id
-           LIMIT 10""",
-        (query,),
+        _TITLE_SELECT + """
+        WHERE LOWER(b.title) = LOWER(?)
+        GROUP BY t.id
+        LIMIT 15""",
+        (search_text,),
     ).fetchall()
     for r in rows:
-        results.append({**dict(r), "match_type": "title_exact"})
+        if r["id"] not in seen_ids:
+            results.append({**dict(r), "match_type": "title_exact"})
+            seen_ids.add(r["id"])
     if results:
         return results
 
-    # Fuzzy: word-by-word LIKE
-    words = [w for w in re.split(r"\s+", query.strip()) if len(w) >= 3]
-    if not words:
-        return []
-    like_clauses = " AND ".join(f"LOWER(b.title) LIKE ?" for _ in words)
-    params = [f"%{w.lower()}%" for w in words]
-    rows = conn.execute(
-        f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
-                  t.embed_text, t.props,
-                  b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
-                  GROUP_CONCAT(DISTINCT p.name) as authors
-           FROM tricks t
-           JOIN books b ON t.book_id = b.id
-           LEFT JOIN book_persons bp ON b.id = bp.book_id AND bp.role = 'author'
-           LEFT JOIN persons p ON bp.person_id = p.id
-           WHERE {like_clauses}
-           GROUP BY t.id
-           LIMIT 10""",
-        params,
-    ).fetchall()
-    for r in rows:
-        results.append({**dict(r), "match_type": "title_fuzzy"})
+    # ── Pass 2: Fuzzy book title match ────────────────────────────────────────
+    words = [w for w in re.split(r"\s+", search_text) if len(w) >= 3]
+    if words:
+        like_clauses = " AND ".join(f"LOWER(b.title) LIKE ?" for _ in words)
+        params = [f"%{w.lower()}%" for w in words]
+        rows = conn.execute(
+            _TITLE_SELECT + f"""
+            WHERE {like_clauses}
+            GROUP BY t.id
+            LIMIT 15""",
+            params,
+        ).fetchall()
+        for r in rows:
+            if r["id"] not in seen_ids:
+                results.append({**dict(r), "match_type": "title_fuzzy"})
+                seen_ids.add(r["id"])
+    if results:
+        return results
+
+    # ── Pass 3: Fuzzy trick title match (for specific effect lookups) ─────────
+    if words:
+        like_clauses = " AND ".join(f"LOWER(t.title) LIKE ?" for _ in words)
+        params = [f"%{w.lower()}%" for w in words]
+        rows = conn.execute(
+            _TITLE_SELECT + f"""
+            WHERE {like_clauses}
+            GROUP BY t.id
+            LIMIT 15""",
+            params,
+        ).fetchall()
+        for r in rows:
+            if r["id"] not in seen_ids:
+                results.append({**dict(r), "match_type": "title_fuzzy"})
+                seen_ids.add(r["id"])
+
     return results
 
 
@@ -300,7 +481,7 @@ def fetch_tricks(trick_ids: list, conn) -> dict:
     placeholders = ",".join("?" * len(trick_ids))
     rows = conn.execute(
         f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
-                  t.embed_text, t.props,
+                  t.embed_text,
                   b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
                   GROUP_CONCAT(DISTINCT p.name) as authors
            FROM tricks t
@@ -322,6 +503,7 @@ def merge_results(
     trick_details: dict,
     excluded_persons: list,
     excluded_keywords: list = None,
+    required_keywords: list = None,
     require_no_props: bool = False,
     max_per_book: int = 2,
     max_per_author: int = 3,
@@ -329,40 +511,47 @@ def merge_results(
 ) -> list:
     """
     Merge title and semantic results, deduplicate, apply per-book/author caps.
-    Excluded persons, excluded_keywords, and require_no_props are hard-filtered.
+    Filters: excluded_persons, excluded_keywords, required_keywords, require_no_props.
+
+    NOTE: require_no_props hard-filtering is done upstream (PROPLESS_EXCLUDED_PROPS
+    are injected into excluded_keywords in search() before calling here).
+    The flag is kept for any future props-column support.
     """
-    seen_ids = set()
+    seen_ids: set = set()
     book_counts: dict = {}
     author_counts: dict = {}
-    final = []
+    final: list = []
 
     excluded_lower = [e.lower() for e in (excluded_persons or [])]
     excluded_kw = [k.lower() for k in (excluded_keywords or [])]
+    required_kw = [k.lower() for k in (required_keywords or [])]
+
+    def _haystack(r) -> str:
+        return " ".join([
+            (r.get("title") or ""),
+            (r.get("description") or ""),
+            (r.get("embed_text") or ""),
+            (r.get("effect_category") or ""),
+        ]).lower()
 
     def _is_filtered(r) -> bool:
-        """Return True if this trick should be completely excluded."""
+        """Return True if this trick should be excluded."""
         credited = (r.get("credited_to") or "").lower()
         authors = (r.get("authors") or "").lower()
 
-        # Hard-exclude explicitly named persons
+        # Hard-exclude explicitly named persons (substring match handles partial names)
         if any(ex in credited or ex in authors for ex in excluded_lower):
             return True
 
-        # Propless filter: exclude tricks that have any extracted prop tags
-        if require_no_props:
-            props = (r.get("props") or "").strip()
-            if props:
-                return True
+        hay = _haystack(r)
 
-        # Keyword filter: exclude tricks whose description/embed_text/props contain excluded terms
-        if excluded_kw:
-            haystack = " ".join([
-                (r.get("description") or ""),
-                (r.get("embed_text") or ""),
-                (r.get("props") or ""),
-            ]).lower()
-            if any(kw in haystack for kw in excluded_kw):
-                return True
+        # Excluded keywords: must NOT appear anywhere in the trick text
+        if excluded_kw and any(kw in hay for kw in excluded_kw):
+            return True
+
+        # Required keywords: ALL must appear somewhere in the trick text
+        if required_kw and not all(kw in hay for kw in required_kw):
+            return True
 
         return False
 
@@ -394,7 +583,7 @@ def merge_results(
             break
         _add(r, r.get("match_type", "title_fuzzy"), score=1.0)
 
-    # Semantic results — hard-filter excluded persons/keywords, add the rest in score order
+    # Semantic results in score order
     for tid, score in semantic_results:
         if len(final) >= total:
             break
@@ -431,12 +620,24 @@ def generate_descriptions(results: list) -> list:
         "Return ONLY a JSON array of strings, one per trick, in order.\n\n"
         + "\n\n".join(items)
     )
-    # Scale token budget: ~120 tokens per description, min 200, max 1500
     max_tok = min(1500, max(200, len(results) * 120))
     try:
         raw = chat_completion(prompt, max_tokens=max_tok, temperature=0.4, json_mode=True)
         parsed = json.loads(raw)
-        descs = list(parsed.values())[0] if isinstance(parsed, dict) else parsed
+        # Robust extraction: handle both list and dict responses
+        if isinstance(parsed, dict):
+            # Try common dict shapes: {"descriptions": [...]} or {0: ..., 1: ...}
+            for key in ("descriptions", "results", "tricks", "items"):
+                if key in parsed and isinstance(parsed[key], list):
+                    descs = parsed[key]
+                    break
+            else:
+                descs = list(parsed.values())
+                # If values are all strings, use them; otherwise flatten
+                if descs and isinstance(descs[0], list):
+                    descs = descs[0]
+        else:
+            descs = parsed  # already a list
         for i, r in enumerate(results):
             r["ai_description"] = str(descs[i]) if i < len(descs) and descs[i] else (r.get("description") or "")
     except Exception as e:
@@ -471,9 +672,6 @@ def generate_commentary(query: str, results: list) -> str:
 def build_result_card(result: dict, rank: int) -> dict:
     """
     Convert a raw search result into the dict expected by the Gradio UI render_card().
-
-    Fields: trick_title, effect_category, author, book_title, pub_year,
-            ai_description, raw_description, match_type, archive_url, rank, score
     """
     archive_id = result.get("archive_id")
     return {
@@ -498,9 +696,9 @@ def build_result_card(result: dict, rank: int) -> dict:
 
 class QueryEngine:
     """
-    Main MagiMatch search engine — wraps the full v4 pipeline.
+    Main MagiMatch search engine.
 
-    Usage (Colab notebook):
+    Usage:
         engine = QueryEngine(
             db_path="data/processed/magimatch.db",
             embeddings_dir="data/embeddings",
@@ -521,10 +719,8 @@ class QueryEngine:
         self.db_path = Path(db_path)
         self.embeddings_dir = Path(embeddings_dir)
 
-        # DB connection
         self.conn = get_connection(self.db_path)
 
-        # Load embeddings
         emb_path = self.embeddings_dir / "tricks.npy"
         ids_path = self.embeddings_dir / "trick_ids.npy"
         if emb_path.exists() and ids_path.exists():
@@ -543,7 +739,6 @@ class QueryEngine:
         Args:
             top_k: total results to fetch and return.
             describe_count: how many results to generate AI descriptions for immediately.
-                            The rest are returned raw (no ai_description) for lazy loading.
                             Pass None to describe all results.
 
         Returns:
@@ -560,64 +755,97 @@ class QueryEngine:
         intent = parse_intent(query)
         logger.info(f"Intent: {intent}")
 
-        # 2. Expand style for referenced persons
-        expanded_query = intent["topic"]
+        # 2. Apply plot aliases — expand query before semantic embedding
+        expanded_query = apply_plot_aliases(intent["topic"])
+
+        # 3. Expand style for referenced persons
         for person in intent["referenced_persons"]:
             style = get_style_description(person, self.conn, web_enriched)
             expanded_query = f"{expanded_query} {style}"
 
-        # Auto-exclude the referenced persons themselves from results — if you ask
-        # for "similar to Asi Wind" you don't want Asi Wind's own tricks showing up.
+        # Auto-exclude the referenced persons themselves from results.
         all_excluded = intent["excluded_persons"] + [
             p.strip().lower() for p in intent["referenced_persons"]
         ]
 
-        # 3. Title pre-pass
+        # 4. Handle require_no_props
+        #    The tricks table has no `props` column, so we use two approaches:
+        #    a) Expand the semantic query with propless keywords (soft signal)
+        #    b) Inject physical-prop root words into excluded_keywords (hard filter)
+        excluded_keywords = list(intent.get("excluded_keywords", []))
+        if intent.get("require_no_props"):
+            expanded_query = f"{expanded_query} {PROPLESS_EXPANSION}"
+            # Hard-filter: exclude results that mention common prop types.
+            # Use a set to avoid duplicates with user-specified excluded_keywords.
+            existing_excl = set(excluded_keywords)
+            for prop in PROPLESS_EXCLUDED_PROPS:
+                if prop not in existing_excl:
+                    excluded_keywords.append(prop)
+
+        required_keywords = intent.get("required_keywords", [])
+
+        # 5. Title pre-pass
         title_results = []
-        if intent["is_title_query"] or len(query.split()) <= 4:
-            title_results = title_search(query, self.conn)
+        title_override = intent.get("title")  # cleaned title extracted by GPT
+        if intent["is_title_query"] or len(query.split()) <= 5:
+            title_results = title_search(query, self.conn, title_override=title_override)
+
             if title_results and intent["is_title_query"]:
-                n = describe_count if describe_count is not None else len(title_results)
-                described = generate_descriptions(title_results[:n])
-                rest = title_results[n:]
+                # Early return for explicit title queries — but APPLY FULL FILTERING first.
+                filtered_title = merge_results(
+                    title_results=title_results,
+                    semantic_results=[],
+                    trick_details={},
+                    excluded_persons=all_excluded,
+                    excluded_keywords=excluded_keywords,
+                    required_keywords=required_keywords,
+                    require_no_props=intent.get("require_no_props", False),
+                    max_per_book=top_k,       # for title queries let through all from that book
+                    max_per_author=top_k,
+                    total=top_k,
+                )
+                n = describe_count if describe_count is not None else len(filtered_title)
+                described = generate_descriptions(filtered_title[:n])
+                rest = filtered_title[n:]
                 all_results = described + rest
                 commentary = generate_commentary(query, described)
                 return {
-                    "results": all_results[:top_k],
+                    "results": all_results,
                     "commentary": commentary,
                     "web_enriched_persons": web_enriched,
                     "query_info": intent,
                 }
 
-        # 4. Semantic search (fetch extra candidates to survive filtering)
+        # 6. Semantic search (fetch extra candidates to survive filtering)
         sem_results = []
         if self.embeddings is not None:
             sem_results = semantic_search(
                 expanded_query, self.embeddings, self.trick_ids, top_k=max(top_k * 5, 60)
             )
 
-        # 5. Fetch details for semantic results
+        # 7. Fetch details for semantic candidates
         sem_ids = [tid for tid, _ in sem_results]
         trick_details = fetch_tricks(sem_ids, self.conn)
 
-        # 6. Merge + deduplicate + filter
+        # 8. Merge + deduplicate + filter
         merged = merge_results(
             title_results=title_results,
             semantic_results=sem_results,
             trick_details=trick_details,
             excluded_persons=all_excluded,
-            excluded_keywords=intent.get("excluded_keywords", []),
+            excluded_keywords=excluded_keywords,
+            required_keywords=required_keywords,
             require_no_props=intent.get("require_no_props", False),
             total=top_k,
         )
 
-        # 7. AI descriptions — only for the first describe_count results (lazy loading)
+        # 9. AI descriptions (lazy: only describe_count upfront)
         n = describe_count if describe_count is not None else len(merged)
         described = generate_descriptions(merged[:n])
         rest = merged[n:]
         all_results = described + rest
 
-        # 8. Commentary (based on the described results)
+        # 10. Commentary
         commentary = generate_commentary(query, described)
 
         return {
@@ -631,13 +859,10 @@ class QueryEngine:
         """
         Generate AI descriptions for results that don't have them yet.
         Used by the load-more UI to lazily generate descriptions on demand.
-        Modifies result dicts in-place and returns the list.
         """
         to_describe = [r for r in results if not r.get("ai_description")]
         if not to_describe:
             return results
-        # generate_descriptions modifies dicts in-place — since to_describe holds
-        # references to the same dict objects, this also updates `results`.
         generate_descriptions(to_describe)
         return results
 
