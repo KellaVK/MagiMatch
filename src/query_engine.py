@@ -294,19 +294,45 @@ def parse_intent(query: str) -> dict:
     """
     system = """You parse magic trick search queries into structured JSON.
 Return ONLY valid JSON with these fields:
-- topic: string, the core topic/theme being searched
-- keywords: list of strings, important search keywords
+
+- topic: string, the core topic in plain language (used for commentary, not search)
+
+- embedding_query: string, a SHORT, keyword-dense phrase (8-15 words max) optimized for
+  vector similarity search — NO stop words, NO filler ("a", "the", "where", "that", "and",
+  "is", "for", "with"), just the most specific nouns, verbs, and adjectives that describe
+  what the user wants. Convert conversational phrasing into precise magic terminology.
+  Examples:
+    "a card trick where the spectator shuffles and the card is located"
+      → "spectator shuffles deck card location found selected card playing cards"
+    "something like what Slydini does with coins"
+      → "coin magic misdirection natural movement lap work visual"
+    "tricks from Expert at the Card Table"
+      → "Expert at the Card Table Erdnase gambling moves sleights"
+    "propless mentalism not Matt Mello"
+      → "propless mentalism psychological bare hands no objects"
+
+- keywords: list of strings, important search keywords taken directly from the query
+
 - excluded_persons: list of strings, names the user wants EXPLICITLY EXCLUDED (e.g. "not Vernon", "not Asi Wind")
+
 - referenced_persons: list of strings, magicians whose STYLE is used as a model (e.g. "like Mello", "similar to Asi Wind") — do NOT add these to excluded_persons; they go here only
+
 - is_title_query: boolean, true if user is searching for a specific book or trick title
+
 - title: string or null, the specific book or trick title being searched — extract only the title text, omitting surrounding words like "tricks from" or "about" — only set when is_title_query is true
+
 - require_no_props: boolean, true ONLY when user explicitly wants effects with absolutely NO physical objects whatsoever — triggered ONLY by: "propless", "no props", "no objects", "empty handed", "bare hands" — do NOT set true for "impromptu", "no gimmicks", or other qualifiers
+
 - excluded_keywords: list of strings, concepts that must NOT appear in results — extract the root word (e.g. "no gimmicks" → ["gimmick"], "no cards" → ["card"], "no coins" → ["coin"], "no ropes" → ["rope"])
+
 - required_keywords: list of strings, specific prop types or concepts that MUST appear in results — extract root word when user is clearly specific about prop type (e.g. "coin tricks" → ["coin"], "rope magic" → ["rope"], "sponge ball" → ["sponge"]) — leave empty for general queries or when prop type is part of style not requirement
+
+IMPORTANT: Be conservative. Only extract what the user explicitly stated. Do not infer or add themes they did not mention.
 """
     prompt = f'Parse this magic search query: "{query}"'
     defaults = {
         "topic": query,
+        "embedding_query": query,
         "keywords": [],
         "excluded_persons": [],
         "referenced_persons": [],
@@ -317,10 +343,12 @@ Return ONLY valid JSON with these fields:
         "required_keywords": [],
     }
     try:
-        raw = chat_completion(prompt, system=system, max_tokens=500, temperature=0.1, json_mode=True)
+        raw = chat_completion(prompt, system=system, max_tokens=600, temperature=0.1, json_mode=True)
         result = json.loads(raw)
         parsed = {
             "topic": result.get("topic", query),
+            # embedding_query falls back to topic, then raw query if GPT omits it
+            "embedding_query": result.get("embedding_query") or result.get("topic") or query,
             "keywords": result.get("keywords", []),
             "excluded_persons": [p.strip().lower() for p in result.get("excluded_persons", [])],
             "referenced_persons": [p.strip() for p in result.get("referenced_persons", [])],
@@ -464,12 +492,29 @@ def cosine_similarity_matrix(query_vec: np.ndarray, matrix: np.ndarray) -> np.nd
     return matrix @ query_vec / (norms * query_norm)
 
 
-def semantic_search(query_text: str, embeddings: np.ndarray, trick_ids: np.ndarray, top_k: int = 40) -> list:
-    """Embed query, compute cosine similarity, return top_k (trick_id, score) pairs."""
+def semantic_search(
+    query_text: str,
+    embeddings: np.ndarray,
+    trick_ids: np.ndarray,
+    top_k: int = 40,
+    min_score: float = 0.22,
+) -> list:
+    """
+    Embed query, compute cosine similarity, return top_k (trick_id, score) pairs.
+
+    min_score: cosine similarity floor — results below this are silently dropped.
+    Prevents low-confidence matches from surfacing and forcing the AI to
+    rationalize irrelevant results. 0.22 is a conservative threshold for
+    OpenAI text-embedding-3-small; raise to 0.28 if results are still noisy.
+    """
     query_vec = embed_single(query_text)
     scores = cosine_similarity_matrix(query_vec, embeddings)
     top_indices = np.argsort(scores)[::-1][:top_k]
-    return [(int(trick_ids[i]), float(scores[i])) for i in top_indices]
+    return [
+        (int(trick_ids[i]), float(scores[i]))
+        for i in top_indices
+        if float(scores[i]) >= min_score
+    ]
 
 
 # ── Fetch trick details ────────────────────────────────────────────────────────
@@ -755,8 +800,9 @@ class QueryEngine:
         intent = parse_intent(query)
         logger.info(f"Intent: {intent}")
 
-        # 2. Apply plot aliases — expand query before semantic embedding
-        expanded_query = apply_plot_aliases(intent["topic"])
+        # 2. Start from the keyword-dense embedding_query (not the raw topic/query).
+        #    apply_plot_aliases expands known plot phrases into technique keywords.
+        expanded_query = apply_plot_aliases(intent["embedding_query"])
 
         # 3. Expand style for referenced persons
         for person in intent["referenced_persons"]:
@@ -773,6 +819,7 @@ class QueryEngine:
         #    a) Expand the semantic query with propless keywords (soft signal)
         #    b) Inject physical-prop root words into excluded_keywords (hard filter)
         excluded_keywords = list(intent.get("excluded_keywords", []))
+
         if intent.get("require_no_props"):
             expanded_query = f"{expanded_query} {PROPLESS_EXPANSION}"
             # Hard-filter: exclude results that mention common prop types.
