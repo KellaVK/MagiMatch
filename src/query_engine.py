@@ -184,19 +184,22 @@ def get_style_description(name: str, conn, web_enriched: list) -> str:
 def parse_intent(query: str) -> dict:
     """
     Parse user query into structured intent using gpt-4o-mini.
-    Returns: {topic, keywords, excluded_persons, referenced_persons, is_title_query}
+    Returns: {topic, keywords, excluded_persons, referenced_persons, is_title_query,
+              require_no_props, excluded_keywords}
     """
     system = """You parse magic trick search queries into structured JSON.
 Return ONLY valid JSON with these fields:
 - topic: string, the core topic/theme being searched
 - keywords: list of strings, important search keywords
-- excluded_persons: list of strings, names the user wants EXCLUDED (e.g. "not Vernon")
-- referenced_persons: list of strings, magicians whose style is referenced (e.g. "like Mello")
+- excluded_persons: list of strings, names the user wants EXPLICITLY EXCLUDED (e.g. "not Vernon", "not Asi Wind")
+- referenced_persons: list of strings, magicians whose STYLE is used as a model (e.g. "like Mello", "similar to Asi Wind") — do NOT add these to excluded_persons; they go here only
 - is_title_query: boolean, true if user is searching for a specific book or trick title
+- require_no_props: boolean, true if the user explicitly wants propless or impromptu effects (triggered by words like "propless", "no props", "no objects", "impromptu", "bare hands", "empty handed")
+- excluded_keywords: list of strings, concepts that must NOT appear in results — extract the root word (e.g. "no gimmicks" → ["gimmick"], "no cards" → ["card"], "no coins" → ["coin"], "no ropes" → ["rope"])
 """
     prompt = f'Parse this magic search query: "{query}"'
     try:
-        raw = chat_completion(prompt, system=system, max_tokens=300, temperature=0.1, json_mode=True)
+        raw = chat_completion(prompt, system=system, max_tokens=400, temperature=0.1, json_mode=True)
         result = json.loads(raw)
         return {
             "topic": result.get("topic", query),
@@ -204,6 +207,8 @@ Return ONLY valid JSON with these fields:
             "excluded_persons": [p.strip().lower() for p in result.get("excluded_persons", [])],
             "referenced_persons": [p.strip() for p in result.get("referenced_persons", [])],
             "is_title_query": bool(result.get("is_title_query", False)),
+            "require_no_props": bool(result.get("require_no_props", False)),
+            "excluded_keywords": [k.strip().lower() for k in result.get("excluded_keywords", [])],
         }
     except Exception as e:
         logger.warning(f"Intent parsing failed: {e}")
@@ -213,6 +218,8 @@ Return ONLY valid JSON with these fields:
             "excluded_persons": [],
             "referenced_persons": [],
             "is_title_query": False,
+            "require_no_props": False,
+            "excluded_keywords": [],
         }
 
 
@@ -224,7 +231,8 @@ def title_search(query: str, conn) -> list:
 
     # Exact match on book title
     rows = conn.execute(
-        """SELECT t.id, t.title, t.description, t.effect_category, t.credited_to, t.embed_text,
+        """SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
+                  t.embed_text, t.props,
                   b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
                   GROUP_CONCAT(DISTINCT p.name) as authors
            FROM tricks t
@@ -248,7 +256,8 @@ def title_search(query: str, conn) -> list:
     like_clauses = " AND ".join(f"LOWER(b.title) LIKE ?" for _ in words)
     params = [f"%{w.lower()}%" for w in words]
     rows = conn.execute(
-        f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to, t.embed_text,
+        f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
+                  t.embed_text, t.props,
                   b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
                   GROUP_CONCAT(DISTINCT p.name) as authors
            FROM tricks t
@@ -290,7 +299,8 @@ def fetch_tricks(trick_ids: list, conn) -> dict:
         return {}
     placeholders = ",".join("?" * len(trick_ids))
     rows = conn.execute(
-        f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to, t.embed_text,
+        f"""SELECT t.id, t.title, t.description, t.effect_category, t.credited_to,
+                  t.embed_text, t.props,
                   b.id as book_id, b.title as book_title, b.pub_year, b.archive_id,
                   GROUP_CONCAT(DISTINCT p.name) as authors
            FROM tricks t
@@ -311,22 +321,56 @@ def merge_results(
     semantic_results: list,
     trick_details: dict,
     excluded_persons: list,
+    excluded_keywords: list = None,
+    require_no_props: bool = False,
     max_per_book: int = 2,
     max_per_author: int = 3,
-    total: int = 10,
+    total: int = 15,
 ) -> list:
     """
     Merge title and semantic results, deduplicate, apply per-book/author caps.
-    Excluded persons are soft-penalized rather than hard-filtered.
+    Excluded persons, excluded_keywords, and require_no_props are hard-filtered.
     """
     seen_ids = set()
     book_counts: dict = {}
     author_counts: dict = {}
     final = []
 
+    excluded_lower = [e.lower() for e in (excluded_persons or [])]
+    excluded_kw = [k.lower() for k in (excluded_keywords or [])]
+
+    def _is_filtered(r) -> bool:
+        """Return True if this trick should be completely excluded."""
+        credited = (r.get("credited_to") or "").lower()
+        authors = (r.get("authors") or "").lower()
+
+        # Hard-exclude explicitly named persons
+        if any(ex in credited or ex in authors for ex in excluded_lower):
+            return True
+
+        # Propless filter: exclude tricks that have any extracted prop tags
+        if require_no_props:
+            props = (r.get("props") or "").strip()
+            if props:
+                return True
+
+        # Keyword filter: exclude tricks whose description/embed_text/props contain excluded terms
+        if excluded_kw:
+            haystack = " ".join([
+                (r.get("description") or ""),
+                (r.get("embed_text") or ""),
+                (r.get("props") or ""),
+            ]).lower()
+            if any(kw in haystack for kw in excluded_kw):
+                return True
+
+        return False
+
     def _add(result_dict, match_type, score=0.0):
         tid = result_dict["id"]
         if tid in seen_ids:
+            return
+        if _is_filtered(result_dict):
             return
         book_id = result_dict["book_id"]
         authors_str = result_dict.get("authors") or ""
@@ -350,33 +394,13 @@ def merge_results(
             break
         _add(r, r.get("match_type", "title_fuzzy"), score=1.0)
 
-    # Semantic results — soft-penalize excluded persons
-    excluded_lower = [e.lower() for e in excluded_persons]
-
-    def _is_excluded(r):
-        credited = (r.get("credited_to") or "").lower()
-        authors = (r.get("authors") or "").lower()
-        return any(ex in credited or ex in authors for ex in excluded_lower)
-
-    non_excluded = [
-        (tid, s, trick_details[tid])
-        for tid, s in semantic_results
-        if tid in trick_details and not _is_excluded(trick_details[tid])
-    ]
-    penalized = [
-        (tid, s, trick_details[tid])
-        for tid, s in semantic_results
-        if tid in trick_details and _is_excluded(trick_details[tid])
-    ]
-
-    for tid, score, r in non_excluded:
+    # Semantic results — hard-filter excluded persons/keywords, add the rest in score order
+    for tid, score in semantic_results:
         if len(final) >= total:
             break
-        _add(r, "semantic", score)
-    for tid, score, r in penalized:
-        if len(final) >= total:
-            break
-        _add(r, "semantic", score * 0.3)
+        if tid not in trick_details:
+            continue
+        _add(trick_details[tid], "semantic", score)
 
     return final[:total]
 
@@ -407,8 +431,10 @@ def generate_descriptions(results: list) -> list:
         "Return ONLY a JSON array of strings, one per trick, in order.\n\n"
         + "\n\n".join(items)
     )
+    # Scale token budget: ~120 tokens per description, min 200, max 1500
+    max_tok = min(1500, max(200, len(results) * 120))
     try:
-        raw = chat_completion(prompt, max_tokens=1200, temperature=0.4, json_mode=True)
+        raw = chat_completion(prompt, max_tokens=max_tok, temperature=0.4, json_mode=True)
         parsed = json.loads(raw)
         descs = list(parsed.values())[0] if isinstance(parsed, dict) else parsed
         for i, r in enumerate(results):
@@ -510,9 +536,15 @@ class QueryEngine:
             self.trick_ids = None
             print("⚠️  Embeddings not found — semantic search disabled. Run src/embedder.py first.")
 
-    def search(self, query: str, top_k: int = 10) -> dict:
+    def search(self, query: str, top_k: int = 15, describe_count: Optional[int] = 3) -> dict:
         """
         Full search pipeline.
+
+        Args:
+            top_k: total results to fetch and return.
+            describe_count: how many results to generate AI descriptions for immediately.
+                            The rest are returned raw (no ai_description) for lazy loading.
+                            Pass None to describe all results.
 
         Returns:
             {
@@ -534,50 +566,80 @@ class QueryEngine:
             style = get_style_description(person, self.conn, web_enriched)
             expanded_query = f"{expanded_query} {style}"
 
+        # Auto-exclude the referenced persons themselves from results — if you ask
+        # for "similar to Asi Wind" you don't want Asi Wind's own tricks showing up.
+        all_excluded = intent["excluded_persons"] + [
+            p.strip().lower() for p in intent["referenced_persons"]
+        ]
+
         # 3. Title pre-pass
         title_results = []
         if intent["is_title_query"] or len(query.split()) <= 4:
             title_results = title_search(query, self.conn)
             if title_results and intent["is_title_query"]:
-                title_results = generate_descriptions(title_results)
-                commentary = generate_commentary(query, title_results)
+                n = describe_count if describe_count is not None else len(title_results)
+                described = generate_descriptions(title_results[:n])
+                rest = title_results[n:]
+                all_results = described + rest
+                commentary = generate_commentary(query, described)
                 return {
-                    "results": title_results[:top_k],
+                    "results": all_results[:top_k],
                     "commentary": commentary,
                     "web_enriched_persons": web_enriched,
                     "query_info": intent,
                 }
 
-        # 4. Semantic search
+        # 4. Semantic search (fetch extra candidates to survive filtering)
         sem_results = []
         if self.embeddings is not None:
-            sem_results = semantic_search(expanded_query, self.embeddings, self.trick_ids, top_k=40)
+            sem_results = semantic_search(
+                expanded_query, self.embeddings, self.trick_ids, top_k=max(top_k * 5, 60)
+            )
 
         # 5. Fetch details for semantic results
         sem_ids = [tid for tid, _ in sem_results]
         trick_details = fetch_tricks(sem_ids, self.conn)
 
-        # 6. Merge + deduplicate
+        # 6. Merge + deduplicate + filter
         merged = merge_results(
             title_results=title_results,
             semantic_results=sem_results,
             trick_details=trick_details,
-            excluded_persons=intent["excluded_persons"],
+            excluded_persons=all_excluded,
+            excluded_keywords=intent.get("excluded_keywords", []),
+            require_no_props=intent.get("require_no_props", False),
             total=top_k,
         )
 
-        # 7. AI descriptions
-        merged = generate_descriptions(merged)
+        # 7. AI descriptions — only for the first describe_count results (lazy loading)
+        n = describe_count if describe_count is not None else len(merged)
+        described = generate_descriptions(merged[:n])
+        rest = merged[n:]
+        all_results = described + rest
 
-        # 8. Commentary
-        commentary = generate_commentary(query, merged)
+        # 8. Commentary (based on the described results)
+        commentary = generate_commentary(query, described)
 
         return {
-            "results": merged,
+            "results": all_results,
             "commentary": commentary,
             "web_enriched_persons": web_enriched,
             "query_info": intent,
         }
+
+    def enrich_results(self, results: list) -> list:
+        """
+        Generate AI descriptions for results that don't have them yet.
+        Used by the load-more UI to lazily generate descriptions on demand.
+        Modifies result dicts in-place and returns the list.
+        """
+        to_describe = [r for r in results if not r.get("ai_description")]
+        if not to_describe:
+            return results
+        # generate_descriptions modifies dicts in-place — since to_describe holds
+        # references to the same dict objects, this also updates `results`.
+        generate_descriptions(to_describe)
+        return results
 
     def get_all_effects(self) -> list:
         """Return sorted list of distinct effect categories."""
